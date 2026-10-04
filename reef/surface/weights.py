@@ -12,6 +12,7 @@ from reef.surface.base import (
     AcceptAnyArtifact,
     AdapterWeightRuntime,
     ArtifactActivator,
+    CheckpointRecoveryRuntime,
     ComponentSurface,
     InferenceHooks,
     RecoveryRestorer,
@@ -123,7 +124,7 @@ class WeightLoader(ArtifactActivator, RecoveryRestorer):
         return runtime_load_id
 
     def restore_recovered(self, artifact: Artifact, runtime: ServingRuntime | None) -> str | None:
-        """Put a recovered head back into a runtime that no longer holds it.
+        """Reload a recovered head into a runtime that explicitly opts into startup restoration.
 
         A runtime keeping its weights inside the Reef process loses them when
         that process exits. Recovery already picks the release that should
@@ -141,7 +142,7 @@ class WeightLoader(ArtifactActivator, RecoveryRestorer):
         artifact recording no version says nothing about the engine, and a
         runtime already serving that version needs nothing.
         """
-        if not isinstance(runtime, WeightRuntime) or artifact.local_path is None:
+        if not isinstance(runtime, CheckpointRecoveryRuntime) or artifact.local_path is None:
             return None
         recorded = artifact_runtime_load_id(artifact)
         if recorded is None:
@@ -155,7 +156,10 @@ class WeightLoader(ArtifactActivator, RecoveryRestorer):
             recorded,
             served,
         )
-        return self.load(artifact, runtime)
+        runtime_load_id = runtime.restore_recovered_checkpoint(artifact)
+        if not isinstance(runtime_load_id, str) or not runtime_load_id:
+            raise TypeError("restore_recovered_checkpoint must return a non-empty runtime load ID")
+        return runtime_load_id
 
 
 class WeightInferenceHooks(InferenceHooks):

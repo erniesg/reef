@@ -66,6 +66,17 @@ class AdapterWeightRuntime(WeightRuntime):
     def serving_adapter_runtime_load_id(self, scenario: str) -> str | None: ...
 
 
+class CheckpointRecoveryRuntime(WeightRuntime):
+    """A weight runtime that explicitly reloads checkpoints during startup.
+
+    Other runtimes keep their own startup recovery and serving activation
+    behavior; supporting rollback does not opt them into checkpoint reloads.
+    """
+
+    @abstractmethod
+    def restore_recovered_checkpoint(self, artifact: Artifact) -> str: ...
+
+
 class ArtifactLoader(ABC):
     """Runtime-backed artifact loading and startup recovery."""
 
@@ -474,6 +485,7 @@ __all__ = [
     "AdapterWeightRuntime",
     "ArtifactActivator",
     "ArtifactLoader",
+    "CheckpointRecoveryRuntime",
     "ComponentSurface",
     "FileTree",
     "HarnessInfo",

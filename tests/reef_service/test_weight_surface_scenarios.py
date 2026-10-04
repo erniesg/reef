@@ -14,7 +14,7 @@ from reef.dispatcher import Dispatcher
 from reef.recipe import Recipe
 from reef.storage.sqlite import SQLiteScenarioStorage
 from reef.surface import adapter_name, create_weight_surface
-from reef.surface.base import ComponentSurface, Surface, WeightRuntime
+from reef.surface.base import CheckpointRecoveryRuntime, ComponentSurface, Surface
 from reef.surface.weights import WeightInferenceHooks, WeightLoader, artifact_runtime_load_id
 
 
@@ -97,11 +97,11 @@ def test_a_restarted_engine_gets_the_recovered_head_loaded_back(tmp_path: Path) 
     """
     restored: list[str] = []
 
-    class Runtime(StubTrainingRuntime, WeightRuntime):
+    class Runtime(StubTrainingRuntime, CheckpointRecoveryRuntime):
         def serving_runtime_load_id(self):
             return "mlx-222-1"  # a fresh process: counter back at one
 
-        def restore_checkpoint(self, artifact):
+        def restore_recovered_checkpoint(self, artifact):
             restored.append(str(artifact.local_path))
             return "mlx-222-2"
 
@@ -127,23 +127,37 @@ def test_a_restarted_engine_gets_the_recovered_head_loaded_back(tmp_path: Path) 
 def test_an_artifact_with_no_recorded_version_is_left_alone(tmp_path: Path) -> None:
     # An unknown published version is not a sign of a stale engine, and a
     # runtime that reports none of its own cannot be compared against.
-    class Runtime(StubTrainingRuntime, WeightRuntime):
+    class Runtime(StubTrainingRuntime, CheckpointRecoveryRuntime):
         def serving_runtime_load_id(self):
             return "mlx-111-40"
 
-        def restore_checkpoint(self, artifact):  # pragma: no cover - must not run
+        def restore_recovered_checkpoint(self, artifact):  # pragma: no cover - must not run
             raise AssertionError("a publication must not reload weights from disk")
 
     assert WeightLoader().restore_recovered(checkpoint(tmp_path, None), Runtime()) is None
 
 
 def test_a_runtime_with_no_known_version_is_not_reloaded(tmp_path: Path) -> None:
-    class UnknownRuntime(StubInferenceRuntime):
-        def restore_checkpoint(self, artifact):
+    class UnknownRuntime(StubInferenceRuntime, CheckpointRecoveryRuntime):
+        def restore_recovered_checkpoint(self, artifact):
             raise AssertionError("an unknown serving version is not a positive mismatch")
 
     runtime = UnknownRuntime(StubTrainingRuntime(), base_url="http://unknown")
     assert WeightLoader().restore_recovered(checkpoint(tmp_path, "inc:40"), runtime) is None
+
+
+@pytest.mark.parametrize("returned_version", [None, "", 42])
+def test_startup_restore_requires_a_nonempty_runtime_version(tmp_path: Path, returned_version: object) -> None:
+    class Runtime(StubInferenceRuntime, CheckpointRecoveryRuntime):
+        def serving_runtime_load_id(self):
+            return "inc:1"
+
+        def restore_recovered_checkpoint(self, artifact):
+            return returned_version
+
+    runtime = Runtime(StubTrainingRuntime(), base_url="http://checkpoint-recovery")
+    with pytest.raises(TypeError, match="restore_recovered_checkpoint must return a non-empty runtime load ID"):
+        WeightLoader().restore_recovered(checkpoint(tmp_path, "inc:40"), runtime)
 
 
 def test_surface_restores_only_the_weight_component_with_its_metadata(tmp_path: Path) -> None:
@@ -152,11 +166,11 @@ def test_surface_restores_only_the_weight_component_with_its_metadata(tmp_path: 
     (tmp_path / "skills").mkdir()
     restored: list[tuple[Path, str]] = []
 
-    class Runtime(StubInferenceRuntime):
+    class Runtime(StubInferenceRuntime, CheckpointRecoveryRuntime):
         def serving_adapter_runtime_load_id(self, scenario):
             return "inc:3" if scenario == "math" else "inc:9"
 
-        def restore_checkpoint(self, artifact):
+        def restore_recovered_checkpoint(self, artifact):
             restored.append((artifact.local_path, artifact.metadata["runtime_load_id"]))
             return "inc:5"
 
@@ -186,11 +200,11 @@ def test_surface_restores_only_the_weight_component_with_its_metadata(tmp_path: 
 def test_a_matching_engine_keeps_serving_the_live_head(tmp_path: Path) -> None:
     # Same process, same weights: recovery leaves the live head in place and
     # activation stays out of the way.
-    class Runtime(StubTrainingRuntime, WeightRuntime):
+    class Runtime(StubTrainingRuntime, CheckpointRecoveryRuntime):
         def serving_runtime_load_id(self):
             return "mlx-111-40"
 
-        def restore_checkpoint(self, artifact):  # pragma: no cover - must not run
+        def restore_recovered_checkpoint(self, artifact):  # pragma: no cover - must not run
             raise AssertionError("an unchanged engine must not be reloaded")
 
     current = LiveWeightArtifactRef(
@@ -212,11 +226,11 @@ def test_a_head_that_is_its_own_checkpoint_still_gets_restored(tmp_path: Path) -
     """
     restored: list[str] = []
 
-    class Runtime(StubTrainingRuntime, WeightRuntime):
+    class Runtime(StubTrainingRuntime, CheckpointRecoveryRuntime):
         def serving_runtime_load_id(self):
             return "mlx-222-1"
 
-        def restore_checkpoint(self, artifact):
+        def restore_recovered_checkpoint(self, artifact):
             restored.append(str(artifact.local_path))
             return "mlx-222-2"
 
@@ -232,6 +246,76 @@ def test_a_head_that_is_its_own_checkpoint_still_gets_restored(tmp_path: Path) -
     # ...but the question it short-circuits past has already been answered.
     assert loader.restore_recovered(ckpt, Runtime()) == "mlx-222-2"
     assert restored == [str(ckpt.local_path)]
+
+
+def test_executor_startup_keeps_coordinator_owned_checkpoint_recovery(tmp_path: Path) -> None:
+    from reef.inference.model_config import ModelConfig
+    from reef.inference.runtime import ExecutorInferenceRuntime
+    from reef.observability import NullExperimentTracker
+    from reef.scenario.factory import ScenarioFactory
+    from reef.service.runtime import connect_executor_runtimes
+    from reef.storage.commits import CommitRecord
+
+    from .test_executor_runtime import Coordinator
+
+    class WeightSurfaceRecipe(Recipe):
+        def serving_surface(self, scenario):
+            return create_weight_surface()
+
+    initial = tmp_path / "initial"
+    initial.mkdir()
+    backend_factory = InMemoryRepositoryBackend.factory(initial, root=tmp_path / "repository")
+    storage = SQLiteScenarioStorage(tmp_path / "state")
+    first = ScenarioFactory(
+        WeightSurfaceRecipe(), backend_factory, scenario_storage=storage, experiment_tracker=NullExperimentTracker()
+    )
+    first.load_or_create("math", model_config=ModelConfig()).close()
+    backend = backend_factory("math")
+    staged = checkpoint(tmp_path, "previous-incarnation:40")
+    published = backend.publish(
+        Artifact.local(staged.local_path, metadata={**backend.metadata(), **staged.metadata}),
+        expected_parent=backend.current(),
+        advance_head=False,
+    )
+    store = storage.open("math")
+    store.commit_step(
+        expected_step=0,
+        commit=CommitRecord(
+            scenario="math",
+            step=1,
+            artifact_ref=published,
+            checkpoint=True,
+            algorithm_state={"steps": 1},
+            high_water_sequence=0,
+            high_water_offset=0,
+        ),
+    )
+    store.close()
+    control = Coordinator()
+    training, runtime = connect_executor_runtimes(train_group_handle=control)
+    assert isinstance(runtime, ExecutorInferenceRuntime)
+    assert runtime.serving_runtime_load_id() == "engine:0"
+    second = ScenarioFactory(
+        WeightSurfaceRecipe(runtime=runtime),
+        backend_factory,
+        scenario_storage=storage,
+        experiment_tracker=NullExperimentTracker(),
+    )
+    scenario = None
+    try:
+        scenario = second.load_or_create("math", model_config=ModelConfig())
+        assert scenario.scenario_step == 1
+        assert scenario.repository.require_current_artifact() == published
+        assert backend.current() == published
+        assert runtime.serving_runtime_load_id() == "engine:0"
+        assert runtime.inference_admission_status["open"] is False
+        assert control.calls == []
+    finally:
+        if scenario is not None:
+            scenario.close()
+        storage.close()
+        training.shutdown()
+        runtime.shutdown()
 
 
 @pytest.mark.parametrize("load_fails", [False, True])
