@@ -336,6 +336,7 @@ class ScenarioFactory:
                 local_dir=self._local_artifact_dir,
             )
             repository.synchronize_checkpoint()
+            surface.restore_recovered(repository.resolve(current_artifact), runtime)
             if not isinstance(current_artifact, LiveWeightArtifactRef):
                 # Traffic must not reach a recovered scenario before its committed
                 # head is servable; a failed activation leaves the scenario unloaded.

@@ -96,6 +96,21 @@ class ArtifactActivator(ArtifactLoader):
     ) -> str: ...
 
 
+class RecoveryRestorer(ArtifactLoader):
+    """Optional loader capability: reload a recovered head at startup.
+
+    Separate from :class:`ArtifactActivator`, which also runs after every
+    publication and rollback: there the weights are already resident, and the
+    signature gives no way to tell the two callers apart. A runtime whose
+    weights live in this process lost them when the previous one exited, so
+    without this the scenario resumes reporting its full step count while
+    answering from the bare base model.
+    """
+
+    @abstractmethod
+    def restore_recovered(self, artifact: Artifact, runtime: ServingRuntime | None) -> str | None: ...
+
+
 class InferenceHooks(ABC):
     """Request and response hooks around one provider inference."""
 
@@ -417,6 +432,15 @@ class Surface:
         if loader is not None:
             loader.load(self.component_artifact(artifact, name), runtime)
 
+    def restore_recovered(self, artifact: Artifact, runtime: ServingRuntime | None) -> None:
+        """Restore the loaded component at startup when its loader explicitly supports recovery."""
+        name = self.loader_component
+        if name is None:
+            return
+        loader = self.components[name].loader
+        if isinstance(loader, RecoveryRestorer):
+            loader.restore_recovered(self.component_artifact(artifact, name), runtime)
+
     def activate(
         self,
         artifact: Artifact,
@@ -456,6 +480,7 @@ __all__ = [
     "InferenceHooks",
     "InferenceLease",
     "LeasingInferenceHooks",
+    "RecoveryRestorer",
     "ServingRuntime",
     "Surface",
     "WeightRuntime",
